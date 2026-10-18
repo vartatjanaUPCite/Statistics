@@ -1,0 +1,351 @@
+---
+title: "MLR and PLS on clearance data"
+author: "T.Varaksina"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# What did we do to select the descriptors, show destribution between train and test set, performance value wiht selection of descriptors and not, conclusion - model good/bad
+
+```{r}
+library(rpart)
+library(MASS)
+library(FactoMineR)
+library(pls)
+library(caret)
+```
+
+```{r}
+pls_df <- read.csv("clearance_data.csv", sep = "\t")
+```
+
+# 1. Split
+```{r train 4/5, test 1/5}
+set.seed(123)
+index <- sample(dim(pls_df)[1])
+data_train <- pls_df[index[1:(dim(pls_df)[1]*0.8)], ]
+data_test <- pls_df[- index[1:(dim(pls_df)[1]*0.8)], ]
+```
+
+```{r}
+# train / test distribution of the target
+dim(data_train)
+dim(data_test)
+summary(data_train$CI)
+summary(data_test$CI)
+ks.test(data_train$CI, data_test$CI)
+```
+
+
+```{r}
+par(mfrow = c(1, 2))
+
+col_train_trans <- "#1C86EEcc"  # Transparent Dodgerblue4
+col_test_trans  <- "#228B22cc"  # Transparent Forestgreen
+
+# identical break alignments so the bars line up perfectly
+all_ci_values <- c(data_train$CI, data_test$CI)
+max_val <- max(all_ci_values)
+breaks_vector <- seq(0, max_val + 0.2, by = 0.15)
+
+# Training Histogram first
+hist(data_train$CI, breaks = breaks_vector, col = col_train_trans, 
+     xlim = c(0, 1.7), ylim = c(0, 25),
+     main = "Merged CI Distribution", xlab = "Clearance (CI)", ylab = "Frequency")
+
+# overlay the Testing Histogram on top of it using add = TRUE
+hist(data_test$CI, breaks = breaks_vector, col = col_test_trans, add = TRUE)
+
+legend("topright", legend = c(paste0("Train (n=", nrow(data_train), ")"), paste0("Test (n=", nrow(data_test), ")")), 
+       fill = c(col_train_trans, col_test_trans), bty = "n")
+
+# boxplot
+boxplot(data_train$CI, data_test$CI, names = c("Train", "Test"), ylab = "Clearance (CI)", 
+        main = "CI Distribution Spread", col = c("dodgerblue4", "forestgreen"), pch = 16) 
+```
+
+# 2. Clean the data
+```{r Leave only descriptors}
+data_train_descr <- data_train[, 5:804]
+which(is.na(data_train_descr), arr.ind = TRUE)
+data_test_descr <- data_test[, 5:804]
+```
+
+```{r Cleaning}
+# 2.1 near zero variance
+nzv_cols <- nearZeroVar(data_train_descr)
+data_train_descr <- data_train_descr[, -nzv_cols]
+data_test_descr  <- data_test_descr[, -nzv_cols]
+
+# 2.2 highly correlated predictors
+corr_matrix_train <- cor(data_train_descr, use = "pairwise.complete.obs")
+highly_correlated_cols <- findCorrelation(corr_matrix_train, cutoff = 0.85)
+data_train_descr <- data_train_descr[, -highly_correlated_cols]
+data_test_descr  <- data_test_descr[, -highly_correlated_cols]
+
+# 2.3 centering and scaling (mean and sd taken from the train set only)
+scaler <- scale(data_train_descr)
+train_features <- as.data.frame(scaler)
+test_features  <- as.data.frame(scale(data_test_descr,
+                                      center = attr(scaler, "scaled:center"),
+                                      scale  = attr(scaler, "scaled:scale")))
+
+cat("Descriptors at start: 800\n")
+cat("Removed by nearZeroVar:", length(nzv_cols), "\n")
+cat("Removed by findCorrelation:", length(highly_correlated_cols), "\n")
+cat("Predictors remaining:", ncol(train_features), "\n")
+```
+
+```{r}
+train_data <- cbind(CI = data_train$CI, train_features)
+test_data  <- cbind(CI = data_test$CI,  test_features)
+
+# the same 10 folds are used for all cross-validations
+set.seed(123)
+folds <- sample(rep(1:10, length.out = nrow(train_data)))
+```
+
+# TASK 1 : MLR
+```{r MLR on Train}
+model_t1 <- lm(CI ~ ., data = train_data)
+summary_t1 <- summary(model_t1)
+sum(is.na(coef(model_t1)))     # coefficients that could not be estimated
+
+# train
+t1_train_r2   <- summary_t1$r.squared
+t1_train_r    <- sqrt(t1_train_r2)
+t1_train_rmse <- sqrt(mean(model_t1$residuals^2))
+
+cat("TASK 1: Train R: ", t1_train_r, "\nTrain R²:", t1_train_r2, "\nTrain RMSE:", t1_train_rmse, "\n\n")
+```
+
+```{r Cross Validation}
+# cross validation on train
+cv_pred_t1 <- rep(NA, nrow(train_data))
+for (i in 1:10) {
+  m <- lm(CI ~ ., data = train_data[folds != i, ])
+  cv_pred_t1[folds == i] <- predict(m, newdata = train_data[folds == i, ])
+}
+
+t1_cv_q2   <- 1 - sum((train_data$CI - cv_pred_t1)^2) / sum((train_data$CI - mean(train_data$CI))^2)
+t1_cv_q    <- cor(train_data$CI, cv_pred_t1)
+t1_cv_rmse <- sqrt(mean((train_data$CI - cv_pred_t1)^2))
+
+cat("TASK 1: CV: Train Q: ", t1_cv_q, "\nTrain Q²:", t1_cv_q2, "\nTrain RMSE:", t1_cv_rmse, "\n")
+```
+
+```{r Validation Test}
+# test
+preds_t1 <- predict(model_t1, newdata = test_data)
+t1_test_rmse <- sqrt(mean((test_data$CI - preds_t1)^2))
+t1_test_r2   <- 1 - sum((test_data$CI - preds_t1)^2) / sum((test_data$CI - mean(test_data$CI))^2)
+t1_test_r    <- cor(test_data$CI, preds_t1)
+
+cat("TASK 1: Test R: ", t1_test_r, "\nTest R²:", t1_test_r2, "\nTest RMSE:", t1_test_rmse, "\n")
+```
+
+
+
+# TASK 2 : Stepwize MLR
+```{r}
+# Fit the simplest possible model (just the intercept)
+intercept_only <- lm(CI ~ 1, data = train_data)
+
+# Fit the full model (used to define the maximum boundary for forward selection)
+full_model <- lm(CI ~ ., data = train_data)
+```
+
+```{r}
+# forward selection; k = log(n) is the BIC penalty and steps = 12 limits the
+# number of descriptors (72 molecules cannot support 176 descriptors)
+stepwise_model <- step(intercept_only, scope = formula(full_model),
+                       direction = "forward", k = log(nrow(train_data)),
+                       steps = 12, trace = 0)
+
+selected_descriptors <- names(coef(stepwise_model))[-1]
+selected_descriptors
+cat("Descriptors retained:", length(selected_descriptors), "\n")
+summary(stepwise_model)
+```
+
+```{r}
+# train
+t2_train_r2   <- summary(stepwise_model)$r.squared
+t2_train_r    <- sqrt(t2_train_r2)
+t2_train_rmse <- sqrt(mean(stepwise_model$residuals^2))
+
+cat("TASK 2: Train R: ", t2_train_r, "\nTrain R²:", t2_train_r2, "\nTrain RMSE:", t2_train_rmse, "\n\n")
+```
+
+```{r}
+# cross validation on train - the selection is repeated inside every fold
+cv_pred_t2 <- rep(NA, nrow(train_data))
+for (i in 1:10) {
+  tr <- train_data[folds != i, ]
+  m0 <- lm(CI ~ 1, data = tr)
+  m  <- step(m0, scope = formula(full_model), direction = "forward",
+             k = log(nrow(tr)), steps = 12, trace = 0)
+  cv_pred_t2[folds == i] <- predict(m, newdata = train_data[folds == i, ])
+}
+
+t2_cv_q2   <- 1 - sum((train_data$CI - cv_pred_t2)^2) / sum((train_data$CI - mean(train_data$CI))^2)
+t2_cv_q    <- cor(train_data$CI, cv_pred_t2)
+t2_cv_rmse <- sqrt(mean((train_data$CI - cv_pred_t2)^2))
+cat("TASK 2: CV: Train Q: ", t2_cv_q, "\nTrain Q²:", t2_cv_q2, "\nTrain RMSE:", t2_cv_rmse, "\n")
+```
+
+```{r}
+# test
+preds_t2 <- predict(stepwise_model, newdata = test_data)
+t2_test_rmse <- sqrt(mean((test_data$CI - preds_t2)^2))
+t2_test_r2   <- 1 - sum((test_data$CI - preds_t2)^2) / sum((test_data$CI - mean(test_data$CI))^2)
+t2_test_r    <- cor(test_data$CI, preds_t2)
+
+cat("TASK 2: Test R: ", t2_test_r, "\nTest R²:", t2_test_r2, "\nTest RMSE:", t2_test_rmse, "\n")
+```
+
+
+
+
+# TASK 3: PLS
+```{r}
+pls_train <- data.frame(CI = train_data$CI)
+pls_train$X <- as.matrix(train_features)
+pls_test <- data.frame(CI = test_data$CI)
+pls_test$X <- as.matrix(test_features)
+
+set.seed(123)
+pls_cv <- plsr(CI ~ X, ncomp = 20, data = pls_train, validation = "CV", segments = 10)
+
+plot(RMSEP(pls_cv), main = "PLS: RMSEP vs number of components")
+abline(v = c(1, 2), lty = 2, col = "blue", lwd = 1.5)
+text(x = 1.3, y = max(RMSEP(pls_cv)$val), labels = "n=1", col = "blue")
+text(x = 2.3, y = max(RMSEP(pls_cv)$val), labels = "n=2", col = "red")
+
+rmsep_cv <- RMSEP(pls_cv)$val[1, 1, -1]
+n_comp <- which.min(rmsep_cv)
+n_comp
+
+pls_model <- plsr(CI ~ X, ncomp = n_comp, data = pls_train)
+```
+
+# Checking if increasing n_comp increase makes the model better
+```{r}
+pls_model <- plsr(CI ~ X, ncomp = 20, data = pls_train)
+
+target_comps <- c(1, 2, 3, 4, 5)
+pls_comparison <- data.frame()
+
+for (nc in target_comps) {
+  
+  # --- Train Metrics ---
+  preds_train <- drop(predict(pls_model, ncomp = nc, newdata = pls_train))
+  train_r2    <- 1 - sum((pls_train$CI - preds_train)^2) / sum((pls_train$CI - mean(pls_train$CI))^2)
+  train_rmse  <- sqrt(mean((pls_train$CI - preds_train)^2))
+  
+  # --- Cross-Validation Metrics (Q²) ---
+  cv_preds   <- drop(pls_cv$validation$pred[, 1, nc])
+  cv_q2      <- 1 - sum((pls_train$CI - cv_preds)^2) / sum((pls_train$CI - mean(pls_train$CI))^2)
+  cv_rmse    <- sqrt(mean((pls_train$CI - cv_preds)^2))
+  
+  # --- Test/Validation Set Metrics ---
+  preds_test <- drop(predict(pls_model, ncomp = nc, newdata = pls_test))
+  test_r2    <- 1 - sum((pls_test$CI - preds_test)^2) / sum((pls_test$CI - mean(pls_test$CI))^2)
+  test_rmse  <- sqrt(mean((pls_test$CI - preds_test)^2))
+  
+  # check for cor() in case variance of predictions is 0
+  if(sd(preds_test) == 0) {
+    test_r <- 0
+  } else {
+    test_r <- cor(pls_test$CI, preds_test)
+  }
+  
+  # --- Combine into a single row ---
+  row_data <- data.frame(
+    Components = nc,
+    Train_R2   = round(train_r2, 4),
+    Train_RMSE = round(train_rmse, 4),
+    CV_Q2      = round(cv_q2, 4),
+    CV_RMSE    = round(cv_rmse, 4),
+    Test_R2    = round(test_r2, 4),
+    Test_RMSE  = round(test_rmse, 4),
+    Test_R     = round(test_r, 4)
+  )
+  
+  pls_comparison <- rbind(pls_comparison, row_data)
+}
+
+print(pls_comparison)
+
+```
+
+```{r Final PLS Evaluation (ncomp = 2)}
+final_n_comp <- 2
+
+# train
+preds_t3_train <- drop(predict(pls_model, ncomp = final_n_comp, newdata = pls_train))
+t3_train_r2   <- 1 - sum((pls_train$CI - preds_t3_train)^2) / sum((pls_train$CI - mean(pls_train$CI))^2)
+t3_train_r    <- sqrt(t3_train_r2)
+t3_train_rmse <- sqrt(mean((pls_train$CI - preds_t3_train)^2))
+```
+
+```{r}
+# cross validation (extra)
+cv_pred_t3 <- drop(pls_cv$validation$pred[, 1, final_n_comp])
+t3_cv_q2   <- 1 - sum((pls_train$CI - cv_pred_t3)^2) / sum((pls_train$CI - mean(pls_train$CI))^2)
+t3_cv_rmse <- sqrt(mean((pls_train$CI - cv_pred_t3)^2))
+```
+
+```{r}
+# test
+preds_t3 <- drop(predict(pls_model, ncomp = final_n_comp, newdata = pls_test))
+t3_test_rmse <- sqrt(mean((pls_test$CI - preds_t3)^2))
+t3_test_r2   <- 1 - sum((pls_test$CI - preds_t3)^2) / sum((pls_test$CI - mean(pls_test$CI))^2)
+t3_test_r    <- cor(pls_test$CI, preds_t3)
+```
+
+
+# Comparison
+```{r}
+results <- data.frame(
+  Model = c("T1 MLR train", "T1 MLR CV", "T1 MLR test",
+            "T2 Stepwise train", "T2 Stepwise CV", "T2 Stepwise test",
+            "T3 PLS train", "T3 PLS test"),
+  R    = c(t1_train_r, t1_cv_q, t1_test_r, t2_train_r, t2_cv_q, t2_test_r, t3_train_r, t3_test_r),
+  R2   = c(t1_train_r2, t1_cv_q2, t1_test_r2, t2_train_r2, t2_cv_q2, t2_test_r2, t3_train_r2, t3_test_r2),
+  RMSE = c(t1_train_rmse, t1_cv_rmse, t1_test_rmse, t2_train_rmse, t2_cv_rmse, t2_test_rmse, t3_train_rmse, t3_test_rmse))
+results[, 2:4] <- round(results[, 2:4], 3)
+print(results)
+cat("PLS CV (extra): Q2 =", round(t3_cv_q2, 3), " RMSE =", round(t3_cv_rmse, 3), "\n")
+cat("RMSE of predicting the train mean for the test set:",
+    round(sqrt(mean((test_data$CI - mean(train_data$CI))^2)), 3), "\n")
+```
+
+# Observed vs predicted
+```{r}
+par(mfrow = c(2, 3))
+
+# Row 1: Standard MLR (Dark Blue for Train, Slate Blue for CV, Green for Test)
+plot(train_data$CI, fitted(model_t1), main = "MLR train", xlab = "Observed", ylab = "Predicted", pch = 16, col = "dodgerblue4"); abline(0, 1, col = "red", lwd = 2)
+
+plot(train_data$CI, cv_pred_t1, main = "MLR CV", xlab = "Observed", ylab = "Predicted", pch = 16, col = "steelblue3"); abline(0, 1, col = "red", lwd = 2)
+
+plot(test_data$CI, preds_t1, main = "MLR test", xlab = "Observed", ylab = "Predicted", pch = 16, col = "forestgreen"); abline(0, 1, col = "red", lwd = 2)
+
+# Row 2: Stepwise MLR
+plot(train_data$CI, fitted(stepwise_model), main = "Stepwise train", xlab = "Observed", ylab = "Predicted", pch = 16, col = "dodgerblue4"); abline(0, 1, col = "red", lwd = 2)
+
+plot(train_data$CI, cv_pred_t2, main = "Stepwise CV", xlab = "Observed", ylab = "Predicted", pch = 16, col = "steelblue3"); abline(0, 1, col = "red", lwd = 2)
+
+plot(test_data$CI, preds_t2, main = "Stepwise test", xlab = "Observed", ylab = "Predicted", pch = 16, col = "forestgreen"); abline(0, 1, col = "red", lwd = 2)
+
+# Row 3: PLS Model
+par(mfrow = c(1, 2))
+plot(pls_train$CI, preds_t3_train, main = "PLS train", xlab = "Observed", ylab = "Predicted", pch = 16, col = "dodgerblue4"); abline(0, 1, col = "red", lwd = 2)
+
+plot(pls_test$CI, preds_t3, main = "PLS test", xlab = "Observed", ylab = "Predicted", pch = 16, col = "forestgreen"); abline(0, 1, col = "red", lwd = 2)
+```
